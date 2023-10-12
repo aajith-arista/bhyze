@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 import os
 import paramiko
 # import pdb
+import pickle
 import re
 import subprocess
 import sys
@@ -96,13 +97,28 @@ class SshClient( paramiko.SSHClient ):
 
 buildhashPattern = re.compile( r'buildhash now (\S*)' )
 
+CACHE_DIR = "/var/cache/bhyze"
+
+def pickleFilepath( bi: AbuildInfo, limit ) -> str:
+   filename =  f'id-{bi.buildId}_limit-{limit}.pkl'
+   return os.path.join( CACHE_DIR, filename )
+
+def innerDict():
+   return defaultdict( str )
+
+def outerDict():
+   return defaultdict( innerDict )
+
 @dataclass
 class HashInfo():
    bi: AbuildInfo
    hashLogs: set = field( default_factory=set )
    pkgDepOrder: list = field( default_factory=list )
-   buildhash: defaultdict = field( default_factory=(
-      lambda: defaultdict( lambda: defaultdict( str ) ) ) )
+
+   # Avoid lambda to support pickling
+   buildhash: defaultdict = field( default_factory=outerDict )
+
+   populated: bool = False
 
    def workspacePath( self ) -> str:
       return f'/var/Abuild/{self.bi.project}/{self.bi.start}'
@@ -164,8 +180,27 @@ class HashInfo():
       for pkg in self.pkgDepOrder[ : pkgLimit ]:
          self.populateBuildHashForPkg( client, pkg )
 
-def LoadHashInfo( bi ) -> HashInfo:
-   return HashInfo( bi )
+   def pickle( self, pkgLimit: int ) -> None:
+      with open( pickleFilepath( self.bi, pkgLimit ), 'wb' ) as f:
+         pickle.dump( self, f )
+
+   def populateAll( self, client: SshClient, pkgLimit: int ) -> None:
+      self.populateHashLogsSet( client )
+      self.populatePkgBuildOrder( client )
+      self.populateBuildhashes( client, pkgLimit )
+      self.populated = True
+      self.pickle( pkgLimit )
+
+def LoadHashInfo( bi: AbuildInfo, pkgLimit: int ) -> HashInfo:
+   fpath = pickleFilepath( bi, pkgLimit )
+   if os.path.exists( fpath ):
+      with open( fpath, 'rb' ) as f:
+         hi = pickle.load( f )
+      assert isinstance( hi, HashInfo )
+      assert hi.bi == bi
+   else:
+      hi = HashInfo( bi )
+   return hi
 
 def main():
    args = parseArgs()
@@ -174,15 +209,15 @@ def main():
 
    assert rbi.platform == ibi.platform
 
+   pkgLimit = args.pkg_limit
    with SshClient( rbi.bs ) as refClient, SshClient( ibi.bs ) as insClient:
-      rhi = LoadHashInfo( rbi )
-      ihi = LoadHashInfo( ibi )
+      rhi = LoadHashInfo( rbi, pkgLimit )
+      ihi = LoadHashInfo( ibi, pkgLimit )
 
       for client, hi in zip( [ refClient, insClient ], [ rhi, ihi ] ):
          hi.validate( client )
-         hi.populateHashLogsSet( client )
-         hi.populatePkgBuildOrder( client )
-         hi.populateBuildhashes( client, args.pkg_limit )
+         if not hi.populated:
+            hi.populateAll( client, pkgLimit )
 
 if __name__ == "__main__":
    main()
