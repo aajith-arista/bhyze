@@ -3,17 +3,14 @@
 # Arista Networks, Inc. Confidential and Proprietary.
 
 import argparse
-from collections import namedtuple, defaultdict
+from collections import defaultdict
+from dataclasses import dataclass, field
 import os
 import paramiko
 # import pdb
 import re
 import subprocess
 import sys
-
-buildInfoFields = [ 'start', 'submit', 'publish', 'id', 'project',
-                    'platform', 'bs' ]
-AbuildInfo = namedtuple( "AbuildInfo", buildInfoFields )
 
 def parseArgs():
    parser = argparse.ArgumentParser()
@@ -32,18 +29,26 @@ def parseArgs():
    args = parser.parse_args()
    return args
 
+@dataclass
+class AbuildInfo():
+   start: str
+   submit: str
+   publish: str
+   buildId: str
+   project: str
+   platform: str
+   bs: str
+
 def getAbuildInfo( buildId: int ) -> AbuildInfo:
    cmd = [ "ap", "abuild", "-q", "-i", str( buildId ) ]
    apAbuildOutput = subprocess.check_output( cmd, text=True,
                                              encoding="utf-8" )
    lines = apAbuildOutput.splitlines()
-   dataFiledHeaders = lines[ 0 ].split()[ : len( buildInfoFields ) ]
    dataFields = lines[ 2 ].split()
 
-   assert dataFiledHeaders == buildInfoFields
-   dataFields = dataFields[ : len( buildInfoFields ) ]
+   dataFields = dataFields[ : 7 ]
    abuildInfo = AbuildInfo( *dataFields )
-   assert abuildInfo.id == str( buildId )
+   assert abuildInfo.buildId == str( buildId )
    return abuildInfo
 
 class SshClient( paramiko.SSHClient ):
@@ -91,60 +96,53 @@ class SshClient( paramiko.SSHClient ):
 
 buildhashPattern = re.compile( r'buildhash now (\S*)' )
 
-class HashInfo:
-   def __init__( self, client: SshClient, bi: AbuildInfo, pkgLimit: int ):
-      self.client = client
-      self.bi = bi
-      self.pkgLimit = pkgLimit
-      self.workspacePath = f'/var/Abuild/{self.bi.project}/{self.bi.start}'
-      self.buildhashLogBasePath = os.path.join( self.workspacePath,
-                                                'tmp/buildhash' )
-      self.abuildLogPath = os.path.join( self.workspacePath,
-                                         'Abuild.log' )
-      self.hashLogs = set()
-      self.pkgDepOrder = []
+@dataclass
+class HashInfo():
+   bi: AbuildInfo
+   hashLogs: set = field( default_factory=set )
+   pkgDepOrder: list = field( default_factory=list )
+   buildhash: defaultdict = field( default_factory=(
+      lambda: defaultdict( lambda: defaultdict( str ) ) ) )
 
-      self.missingHashLogs = set()
+   def workspacePath( self ) -> str:
+      return f'/var/Abuild/{self.bi.project}/{self.bi.start}'
 
-      # two-level dict
-      # first level keyed by pkgName
-      # second level keyed by "contents", "deps" and "final"
-      self.buildhash = defaultdict( lambda: defaultdict( str ) )
+   def buildhashLogBasePath( self ) -> str:
+      return os.path.join( self.workspacePath(), 'tmp/buildhash' )
 
-   def validate( self ):
-      cmd = f'test -d {self.buildhashLogBasePath}'
-      self.client.runCmd( cmd )
+   def abuildLogPath( self ) -> str:
+      return os.path.join( self.workspacePath(), 'Abuild.log' )
 
-   def populateHashLogsSet( self ) -> None:
-      cmd = f'ls {self.buildhashLogBasePath}'
-      cmdOutput, _ = self.client.runCmd( cmd )
+   def validate( self, client: SshClient ) -> str:
+      cmd = f'test -d {self.buildhashLogBasePath()}'
+      client.runCmd( cmd )
+
+   def populateHashLogsSet( self, client: SshClient ) -> None:
+      cmd = f'ls {self.buildhashLogBasePath()}'
+      cmdOutput, _ = client.runCmd( cmd )
       cmdOutputLines = cmdOutput.splitlines()
       self.hashLogs = { x.split( '.' )[ 0 ] for x in cmdOutputLines }
 
-   def populatePkgBuildOrder( self ) -> None:
+   def populatePkgBuildOrder( self, client: SshClient ) -> None:
       cmd = ' '.join( [
          'grep', '-m', '1',
          '''"'a4 make' packages:"''',
-         self.abuildLogPath ] )
-      cmdOutput, _ = self.client.runCmd( cmd )
+         self.abuildLogPath() ] )
+      cmdOutput, _ = client.runCmd( cmd )
       pattern = r"'a4 make' packages:\s*(.*)"
       mObj = re.search( pattern, cmdOutput )
       pkgList = mObj.group( 1 ).split()
       self.pkgDepOrder = [ p.removesuffix( '(!)' ) for p in pkgList ]
-      if self.pkgLimit is None:
-         self.pkgLimit = len( self.pkgDepOrder )
-
-      self.missingHashLogs = set( self.pkgDepOrder ) - self.hashLogs
 
    def pkgHashLog( self, pkg: str ) -> str:
-      return os.path.join( self.buildhashLogBasePath, pkg + '.log' )
+      return os.path.join( self.buildhashLogBasePath(), pkg + '.log' )
 
-   def populateBuildHashForPkg( self, pkg: str ) -> None:
+   def populateBuildHashForPkg( self, client: SshClient, pkg: str ) -> None:
       if pkg not in self.hashLogs:
          return
 
       def populateHashType( htype, cmd ):
-         cmdOutput, _ = self.client.runCmd( cmd )
+         cmdOutput, _ = client.runCmd( cmd )
          mObj = buildhashPattern.match( cmdOutput )
          assert mObj
          self.buildhash[ pkg ][ htype ] = mObj.group( 1 )
@@ -160,26 +158,31 @@ class HashInfo:
       for it in buildhashTypes:
          populateHashType( *it )
 
-   def populateBuildhashes( self ):
-      for pkg in self.pkgDepOrder[ : self.pkgLimit ]:
-         self.populateBuildHashForPkg( pkg )
+   def populateBuildhashes( self, client: SshClient, pkgLimit: int ) -> None:
+      if pkgLimit is None:
+         pkgLimit = len( self.pkgDepOrder )
+      for pkg in self.pkgDepOrder[ : pkgLimit ]:
+         self.populateBuildHashForPkg( client, pkg )
+
+def LoadHashInfo( bi ) -> HashInfo:
+   return HashInfo( bi )
 
 def main():
    args = parseArgs()
-   refInfo = getAbuildInfo( args.reference_id )
-   insInfo = getAbuildInfo( args.inspect_id )
+   rbi = getAbuildInfo( args.reference_id )
+   ibi = getAbuildInfo( args.inspect_id )
 
-   assert refInfo.platform == insInfo.platform
+   assert rbi.platform == ibi.platform
 
-   with SshClient( refInfo.bs ) as refClient, SshClient( insInfo.bs ) as insClient:
-      rhi = HashInfo( refClient, refInfo, args.pkg_limit )
-      ihi = HashInfo( insClient, insInfo, args.pkg_limit )
+   with SshClient( rbi.bs ) as refClient, SshClient( ibi.bs ) as insClient:
+      rhi = LoadHashInfo( rbi )
+      ihi = LoadHashInfo( ibi )
 
-      for hi in [ rhi, ihi ]:
-         hi.validate()
-         hi.populateHashLogsSet()
-         hi.populatePkgBuildOrder()
-         hi.populateBuildhashes()
+      for client, hi in zip( [ refClient, insClient ], [ rhi, ihi ] ):
+         hi.validate( client )
+         hi.populateHashLogsSet( client )
+         hi.populatePkgBuildOrder( client )
+         hi.populateBuildhashes( client, args.pkg_limit )
 
 if __name__ == "__main__":
    main()
