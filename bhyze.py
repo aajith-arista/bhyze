@@ -196,7 +196,13 @@ class HashInfo():
          return
 
       def populateHashType( htype, cmd ):
-         cmdOutput, _ = client.runCmd( cmd )
+         try:
+            cmdOutput, _ = client.runCmd( cmd )
+         except SshClient.RunCmdErr:
+            if htype != "deps":
+               raise
+            self.buildhash[ pkg ][ htype ] = 'NA'
+            return
          mObj = buildhashPattern.match( cmdOutput )
          assert mObj
          self.buildhash[ pkg ][ htype ] = mObj.group( 1 )
@@ -421,7 +427,7 @@ class PackageDiff:
             print( f'Analyzing depsContentSig computation of {refRpm} further!' )
             self.analyzeDepsContentSig( refRpm, insRpm )
          else:
-            print( 'InstallSig difference is due to content change in {refRpm}' )
+            print( f'InstallSig difference is due to content change in {refRpm}' )
             print( f'Reference:\n\t{lhs}' )
             print( f'Inspect:\n\t{rhs}' )
 
@@ -440,7 +446,7 @@ class PackageDiff:
          print( f'Reference:\n\t{lhs}' )
          print( f'Inspect:\n\t{rhs}' )
       else:
-         print( 'Depsig change first detected here:' )
+         print( 'Buildhash change due to Depsig change' )
          refInstallSig = getInstallSig( lhs )
          insInstallSig = getInstallSig( rhs )
          self.analyzeInstallSigDiff( refInstallSig, insInstallSig )
