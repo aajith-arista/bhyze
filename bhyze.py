@@ -52,7 +52,6 @@ def parseArgs():
                                 type=str,
                                 help='Specify package' )
 
-
    args = parser.parse_args()
    return args
 
@@ -123,6 +122,12 @@ class AbuildInfo():
    def abuildLogPath( self ) -> str:
       return os.path.join( self.workspacePath(), 'Abuild.log' )
 
+   def pkgHashLog( self, pkg: str ) -> str:
+      return os.path.join( self.buildhashLogBasePath(), pkg + '.log' )
+
+   def pkgHashDepsLog( self, pkg: str ) -> str:
+      return os.path.join( self.buildhashLogBasePath(), pkg + '.deps.log' )
+
    def validate( self, client: SshClient, pkg: Optional[str] = None ) -> str:
       if pkg is not None:
          path = os.path.join( self.buildhashLogBasePath(), f'{pkg}.log' )
@@ -186,9 +191,6 @@ class HashInfo():
       pkgList = mObj.group( 1 ).split()
       self.pkgDepOrder = [ p.removesuffix( '(!)' ) for p in pkgList ]
 
-   def pkgHashLog( self, pkg: str ) -> str:
-      return os.path.join( self.bi.buildhashLogBasePath(), pkg + '.log' )
-
    def populateBuildHashForPkg( self, client: SshClient, pkg: str ) -> None:
       if pkg not in self.hashLogs:
          return
@@ -201,11 +203,11 @@ class HashInfo():
 
       buildhashTypes = [
             ( 'content',
-              f'tac {self.pkgHashLog( pkg )} | grep -m 1 "due to contents of"' ),
+              f'tac {self.bi.pkgHashLog( pkg )} | grep -m 1 "due to contents of"' ),
             ( 'deps',
-              f'tac {self.pkgHashLog( pkg )} | grep -m 1 "due to depSig"' ),
+              f'tac {self.bi.pkgHashLog( pkg )} | grep -m 1 "due to depSig"' ),
             ( 'final',
-              f'tac {self.pkgHashLog( pkg )} | grep -m 1 "^buildhash now"' ),
+              f'tac {self.bi.pkgHashLog( pkg )} | grep -m 1 "^buildhash now"' ),
          ]
       for it in buildhashTypes:
          populateHashType( *it )
@@ -296,15 +298,152 @@ def diffSummaryCmd( args ):
    print( tabulate( displayList[ displayStart : displayEnd ],
                     headers=[ 'pkg', 'reason' ] ) )
 
-class PackageDif:
-   def __init__( self, rbi: AbuildInfo, ibi: AbuildInfo, pkg: str ):
+def loadFileContents( client: SshClient, path: str,
+                      tolerateFailure: bool=False ) -> Optional[ str ]:
+   if tolerateFailure:
+      try:
+         checkPath( client, path, isFile=True )
+      except  SshClient.RunCmdErr:
+         return None
+
+   sftpClient = client.open_sftp()
+   with sftpClient.open( path ) as f:
+      contents = f.read()
+   return contents.decode( 'utf-8' )
+
+def findDiffLine( l1: str, l2: str ) -> ( Optional[ str ], Optional[ str ] ):
+   l1Lines = l1.splitlines()
+   l2Lines = l2.splitlines()
+
+   iterLimit = min( len( l1Lines ), len( l2Lines ) )
+   for i in range( iterLimit ):
+      if l1Lines[ i ] != l2Lines[ i ]:
+         return ( l1Lines[ i ], l2Lines[ i ] )
+   return ( None, None )
+
+def getInstallSig( logLine ) -> str:
+   depSigPattern = r"depSig now \S* due to full: len=\d*=b'(.*)'$"
+   mObj = re.match( depSigPattern, logLine )
+   if not mObj:
+      print( f'bad log line, installSig match fail.\nline=\n{logLine}' )
+      assert False, 'bad log line'
+   return bytes(  mObj.group( 1 ), 'utf-8' ).decode( 'unicode_escape' )
+
+def getRpmFromInstallSig( sig ) -> str:
+   return sig.splitlines()[ 0 ] 
+
+class PackageDiff:
+   def __init__( self,
+                 rbi: AbuildInfo,
+                 rclient: SshClient,
+                 ibi: AbuildInfo,
+                 iclient: SshClient,
+                 pkg: str ):
       self.rbi = rbi
+      self.rclient = rclient
       self.ibi = ibi
+      self.iclient = iclient
+      self.pkg = pkg
 
       self.rlog = None
       self.ilog = None
       self.rdeplog = None
       self.ideplog = None
+
+   def loadLogs( self ):
+      rlogpath = self.rbi.pkgHashLog( self.pkg )
+      rdeplogpath = self.rbi.pkgHashDepsLog( self.pkg )
+      ilogpath = self.ibi.pkgHashLog( self.pkg )
+      ideplogpath = self.ibi.pkgHashDepsLog( self.pkg )
+
+      self.rlog = loadFileContents( self.rclient, rlogpath )
+      self.rdeplog =  loadFileContents( self.rclient, rdeplogpath,
+                                         tolerateFailure=True )
+      self.ilog = loadFileContents( self.iclient, ilogpath )
+      self.ideplog = loadFileContents( self.iclient, ideplogpath,
+                                       tolerateFailure=True )
+
+   def getDepsContentSigPattern( self, rpm ):
+      rpmNameWithEpoch = rpm.split( ':' )[ 0 ]
+      rpmName = rpmNameWithEpoch.removesuffix( '-None' )
+      rpmVersion = rpm.split( ':' )[ 1 ].split( '-' )[ 0 ]
+      rpmNameWithVersion = rpmName + '-' + rpmVersion
+      
+      patternPrefix = 'CALCULATING DEPSCONTENTSIG FOR'
+      patternSuffix = 'in the context of PACKAGE'
+      pattern = ' '.join( [
+         patternPrefix,
+         rpmNameWithVersion,
+         patternSuffix,
+         self.pkg ] )
+      return pattern
+
+   def getDepsSubLog( self, log, pattern ):
+      assert log is not None
+      logLines = log.splitlines()
+      startIndex = logLines.index( pattern ) + 1
+      i = startIndex + 1
+      endIndex = startIndex
+      while i < len( logLines ):
+         if logLines[ i ].startswith( 'depsContentSig now' ):
+            endIndex = i
+            i += 1
+         else:
+            break
+      return '\n'.join( logLines[ startIndex:endIndex ] )
+
+   def analyzeDepsContentSig( self, refRpm, insRpm ):
+      refPattern = self.getDepsContentSigPattern( refRpm )
+      refDepsLog = self.getDepsSubLog( self.rdeplog, refPattern )
+
+      insPattern = self.getDepsContentSigPattern( insRpm )
+      insDepsLog = self.getDepsSubLog( self.ideplog, insPattern )
+      lhs, rhs = findDiffLine( refDepsLog, insDepsLog )
+      print( 'DepsContentSig change isolated:' )
+      print( f'Reference:\n\t{lhs}' )
+      print( f'Inspect:\n\t{rhs}' )
+
+   def analyzeInstallSigDiff( self, rsig, isig ):
+
+      refRpm = getRpmFromInstallSig( rsig )
+      insRpm = getRpmFromInstallSig( isig )
+      if refRpm != insRpm:
+         print( 'Rpm added/deleted' )
+         print( f'Reference:\n\t{refRpm}' )
+         print( f'Inspect:\n\t{insRpm}' )
+      else:
+         print( f'InstallSig of rpm {refRpm} has changed.' )
+         lhs, rhs = findDiffLine( rsig, isig ) 
+         depContentSigPrefix = 'depsContentSig:'
+         if lhs.startswith( depContentSigPrefix ) and \
+               rhs.startswith( depContentSigPrefix ):
+            print( 'InstallSig difference is due to depContentSig change' )
+            print( f'Analyzing depsContentSig computation of {refRpm} further!' )
+            self.analyzeDepsContentSig( refRpm, insRpm )
+         else:
+            print( 'InstallSig difference is due to content change in {refRpm}' )
+            print( f'Reference:\n\t{lhs}' )
+            print( f'Inspect:\n\t{rhs}' )
+
+   def analyze( self ):
+      lhs, rhs = findDiffLine( self.rlog, self.ilog )
+      if lhs is None:
+         print( "Build hashes are the same, nothing to analyze!" )
+         return
+      assert rhs is not None
+
+      buildhashChangeStr = "buildhash now"
+
+      if lhs.startswith( buildhashChangeStr ) and \
+            rhs.startswith( buildhashChangeStr ):
+         print( 'Buildhash change due to contents/env/setting:' )
+         print( f'Reference:\n\t{lhs}' )
+         print( f'Inspect:\n\t{rhs}' )
+      else:
+         print( 'Depsig change first detected here:' )
+         refInstallSig = getInstallSig( lhs )
+         insInstallSig = getInstallSig( rhs )
+         self.analyzeInstallSigDiff( refInstallSig, insInstallSig )
 
 def diffPackageCmd( args ):
    rbi = getAbuildInfo( args.reference_id )
@@ -314,15 +453,15 @@ def diffPackageCmd( args ):
    pkg = args.pkg
 
    with SshClient( rbi.bs ) as refClient, SshClient( ibi.bs ) as insClient:
-      rhi = HashInfo( rbi )
-      ihi = HashInfo( ibi )
-
-      for client, hi in zip( [ refClient, insClient ], [ rhi, ihi ] ):
-         hi.bi.validate( client, pkg )
-         #hi.loadLogs()
-      import pdb
-      pdb.set_trace()
-      print( "hello" )
+      rbi.validate( refClient, pkg )
+      ibi.validate( insClient, pkg )
+      pd = PackageDiff( rbi, refClient,
+                        ibi, insClient,
+                        pkg )
+      print( 'loading logs!' )
+      pd.loadLogs()
+      print( 'logs loaded, analyzing!' )
+      pd.analyze()
 
 def main():
    args = parseArgs()
