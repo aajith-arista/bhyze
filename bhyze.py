@@ -16,25 +16,33 @@ from tabulate import tabulate
 
 def parseArgs():
    parser = argparse.ArgumentParser()
-   parser.add_argument( '--reference-id', '-r',
-                        type=int,
-                        required=True,
-                        help='Reference build-id' )
-   parser.add_argument( '--inspect-id', '-i',
-                        type=int,
-                        required=True,
-                        help='Inspect build-id' )
-   parser.add_argument( '--pkg-limit', '-l',
-                        type=int, default=None,
-                        help='Limit computation to first <PKG_LIMIT> packages' )
-   parser.add_argument( '--display-start', '-ds',
-                        type=int, default=None,
-                        help='Start displaying from <DISPLAY_START>th '
-                             'package' )
-   parser.add_argument( '--display-limit', '-dl',
-                        type=int, default=None,
-                        help='Limit displaying differences for '
-                             '<DISPLAY_LIMIT> packages' )
+   sub_parsers = parser.add_subparsers( dest='subcommand',
+                                        help='sub commands' )
+   diff_parser = sub_parsers.add_parser( 'diff',
+                                         help='Diff two builds' )
+   diff_parser.add_argument( 'reference_id',
+                             type=int,
+                             help='Reference build-id' )
+   diff_parser.add_argument( 'inspect_id',
+                             type=int,
+                             help='Inspect build-id' )
+   diff_sub_parsers =  diff_parser.add_subparsers( dest='diff_subcommand',
+                                                   help='diff subcommands' )
+
+   summary_parser = diff_sub_parsers.add_parser( 'summary',
+                                                 help='Display summary of diff' )
+   summary_parser.add_argument( '--pkg-limit', '-l',
+                                type=int, default=None,
+                                help='Limit computation to first '
+                                     '<PKG_LIMIT> packages' )
+   summary_parser.add_argument( '--display-start', '-ds',
+                                type=int, default=None,
+                                help='Start displaying from <DISPLAY_START>th '
+                                     'package' )
+   summary_parser.add_argument( '--display-limit', '-dl',
+                                type=int, default=None,
+                                help='Limit displaying differences for '
+                                '<DISPLAY_LIMIT> packages' )
 
    args = parser.parse_args()
    return args
@@ -271,7 +279,9 @@ def diffSummary( args ):
 
 def main():
    args = parseArgs()
-   diffSummary( args )
+   if args.subcommand == 'diff':
+      if args.diff_subcommand == 'summary':
+         diffSummary( args )
 
 if __name__ == "__main__":
    main()
