@@ -12,6 +12,7 @@ import pickle
 import re
 import subprocess
 import sys
+from tabulate import tabulate
 
 def parseArgs():
    parser = argparse.ArgumentParser()
@@ -26,6 +27,14 @@ def parseArgs():
    parser.add_argument( '--pkg-limit', '-l',
                         type=int, default=None,
                         help='Limit computation to first <PKG_LIMIT> packages' )
+   parser.add_argument( '--display-start', '-ds',
+                        type=int, default=None,
+                        help='Start displaying from <DISPLAY_START>th '
+                             'package' )
+   parser.add_argument( '--display-limit', '-dl',
+                        type=int, default=None,
+                        help='Limit displaying differences for '
+                             '<DISPLAY_LIMIT> packages' )
 
    args = parser.parse_args()
    return args
@@ -100,7 +109,7 @@ buildhashPattern = re.compile( r'buildhash now (\S*)' )
 CACHE_DIR = "/var/cache/bhyze"
 
 def pickleFilepath( bi: AbuildInfo, limit ) -> str:
-   filename =  f'id-{bi.buildId}_limit-{limit}.pkl'
+   filename = f'id-{bi.buildId}_limit-{limit}.pkl'
    return os.path.join( CACHE_DIR, filename )
 
 def innerDict():
@@ -202,8 +211,7 @@ def LoadHashInfo( bi: AbuildInfo, pkgLimit: int ) -> HashInfo:
       hi = HashInfo( bi )
    return hi
 
-def main():
-   args = parseArgs()
+def diffSummary( args ):
    rbi = getAbuildInfo( args.reference_id )
    ibi = getAbuildInfo( args.inspect_id )
 
@@ -218,6 +226,52 @@ def main():
          hi.validate( client )
          if not hi.populated:
             hi.populateAll( client, pkgLimit )
+
+   iterLimit = pkgLimit or len( ihi.pkgDepOrder )
+   displayList = []
+   reasonVerbose = {
+      'content': 'package contents changed',
+      'deps': 'depSig changed',
+      'final': 'build setting/env changed',
+   }
+   matchCount = 0
+   accounted = 0
+   for pkg in ihi.pkgDepOrder[ : iterLimit ]:
+      if pkg not in ihi.buildhash:
+         continue
+      if pkg not in rhi.buildhash:
+         continue
+      accounted += 1
+      ibh = ihi.buildhash[ pkg ]
+      rbh = rhi.buildhash[ pkg ]
+
+      if ibh[ 'final' ] == rbh[ 'final' ]:
+         matchCount += 1
+         continue
+
+      if ibh[ 'content' ] != rbh[ 'content' ]:
+         displayList.append( ( pkg, reasonVerbose[ 'content' ] ) )
+      elif ibh[ 'deps' ] != rbh[ 'deps' ]:
+         displayList.append( ( pkg, reasonVerbose[ 'deps' ] ) )
+      else:
+         displayList.append( ( pkg, reasonVerbose[ 'final' ] ) )
+         displayList[ pkg ] = 'final'
+
+   print( f'Total packages considered: {iterLimit}' )
+   print( f'Hashes encountered: {accounted}' )
+   print( f'Num of matching hashes: {accounted - len( displayList )}' )
+   print( f'Num of mismatched hashes: {len( displayList )}' )
+   print( '' )
+
+   displayStart = 0 if args.display_start is None else args.display_start
+   displayLimit = args.display_limit or len( displayList )
+   displayEnd = displayStart + displayLimit
+   print( tabulate( displayList[ displayStart : displayEnd ],
+                    headers=[ 'pkg', 'reason' ] ) )
+
+def main():
+   args = parseArgs()
+   diffSummary( args )
 
 if __name__ == "__main__":
    main()
