@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 from tabulate import tabulate
+from typing import Optional
 
 def parseArgs():
    parser = argparse.ArgumentParser()
@@ -44,30 +45,16 @@ def parseArgs():
                                 help='Limit displaying differences for '
                                 '<DISPLAY_LIMIT> packages' )
 
+   package_parser = diff_sub_parsers.add_parser(
+         'package',
+         help='Display details of a package' )
+   package_parser.add_argument( 'pkg',
+                                type=str,
+                                help='Specify package' )
+
+
    args = parser.parse_args()
    return args
-
-@dataclass
-class AbuildInfo():
-   start: str
-   submit: str
-   publish: str
-   buildId: str
-   project: str
-   platform: str
-   bs: str
-
-def getAbuildInfo( buildId: int ) -> AbuildInfo:
-   cmd = [ "ap", "abuild", "-q", "-i", str( buildId ) ]
-   apAbuildOutput = subprocess.check_output( cmd, text=True,
-                                             encoding="utf-8" )
-   lines = apAbuildOutput.splitlines()
-   dataFields = lines[ 2 ].split()
-
-   dataFields = dataFields[ : 7 ]
-   abuildInfo = AbuildInfo( *dataFields )
-   assert abuildInfo.buildId == str( buildId )
-   return abuildInfo
 
 class SshClient( paramiko.SSHClient ):
    def __init__( self, host ):
@@ -112,6 +99,51 @@ class SshClient( paramiko.SSHClient ):
                                errMsg )
       return stdoutText, stderrText
 
+def checkPath( client: SshClient, path: str, isFile: bool ):
+   flag = '-f' if isFile else '-d'
+   cmd = f'test {flag} {path}'
+   client.runCmd( cmd )
+
+@dataclass
+class AbuildInfo():
+   start: str
+   submit: str
+   publish: str
+   buildId: str
+   project: str
+   platform: str
+   bs: str
+
+   def workspacePath( self ) -> str:
+      return f'/var/Abuild/{self.project}/{self.start}'
+
+   def buildhashLogBasePath( self ) -> str:
+      return os.path.join( self.workspacePath(), 'tmp/buildhash' )
+
+   def abuildLogPath( self ) -> str:
+      return os.path.join( self.workspacePath(), 'Abuild.log' )
+
+   def validate( self, client: SshClient, pkg: Optional[str] = None ) -> str:
+      if pkg is not None:
+         path = os.path.join( self.buildhashLogBasePath(), f'{pkg}.log' )
+         isFile = True
+      else:
+         path = self.buildhashLogBasePath()
+         isFile=False
+      checkPath( client, path, isFile )
+
+def getAbuildInfo( buildId: int ) -> AbuildInfo:
+   cmd = [ "ap", "abuild", "-q", "-i", str( buildId ) ]
+   apAbuildOutput = subprocess.check_output( cmd, text=True,
+                                             encoding="utf-8" )
+   lines = apAbuildOutput.splitlines()
+   dataFields = lines[ 2 ].split()
+
+   dataFields = dataFields[ : 7 ]
+   abuildInfo = AbuildInfo( *dataFields )
+   assert abuildInfo.buildId == str( buildId )
+   return abuildInfo
+
 buildhashPattern = re.compile( r'buildhash now (\S*)' )
 
 CACHE_DIR = "/var/cache/bhyze"
@@ -137,21 +169,8 @@ class HashInfo():
 
    populated: bool = False
 
-   def workspacePath( self ) -> str:
-      return f'/var/Abuild/{self.bi.project}/{self.bi.start}'
-
-   def buildhashLogBasePath( self ) -> str:
-      return os.path.join( self.workspacePath(), 'tmp/buildhash' )
-
-   def abuildLogPath( self ) -> str:
-      return os.path.join( self.workspacePath(), 'Abuild.log' )
-
-   def validate( self, client: SshClient ) -> str:
-      cmd = f'test -d {self.buildhashLogBasePath()}'
-      client.runCmd( cmd )
-
    def populateHashLogsSet( self, client: SshClient ) -> None:
-      cmd = f'ls {self.buildhashLogBasePath()}'
+      cmd = f'ls {self.bi.buildhashLogBasePath()}'
       cmdOutput, _ = client.runCmd( cmd )
       cmdOutputLines = cmdOutput.splitlines()
       self.hashLogs = { x.split( '.' )[ 0 ] for x in cmdOutputLines }
@@ -160,7 +179,7 @@ class HashInfo():
       cmd = ' '.join( [
          'grep', '-m', '1',
          '''"'a4 make' packages:"''',
-         self.abuildLogPath() ] )
+         self.bi.abuildLogPath() ] )
       cmdOutput, _ = client.runCmd( cmd )
       pattern = r"'a4 make' packages:\s*(.*)"
       mObj = re.search( pattern, cmdOutput )
@@ -168,7 +187,7 @@ class HashInfo():
       self.pkgDepOrder = [ p.removesuffix( '(!)' ) for p in pkgList ]
 
    def pkgHashLog( self, pkg: str ) -> str:
-      return os.path.join( self.buildhashLogBasePath(), pkg + '.log' )
+      return os.path.join( self.bi.buildhashLogBasePath(), pkg + '.log' )
 
    def populateBuildHashForPkg( self, client: SshClient, pkg: str ) -> None:
       if pkg not in self.hashLogs:
@@ -219,7 +238,7 @@ def LoadHashInfo( bi: AbuildInfo, pkgLimit: int ) -> HashInfo:
       hi = HashInfo( bi )
    return hi
 
-def diffSummary( args ):
+def diffSummaryCmd( args ):
    rbi = getAbuildInfo( args.reference_id )
    ibi = getAbuildInfo( args.inspect_id )
 
@@ -231,7 +250,7 @@ def diffSummary( args ):
       ihi = LoadHashInfo( ibi, pkgLimit )
 
       for client, hi in zip( [ refClient, insClient ], [ rhi, ihi ] ):
-         hi.validate( client )
+         hi.bi.validate( client )
          if not hi.populated:
             hi.populateAll( client, pkgLimit )
 
@@ -277,11 +296,45 @@ def diffSummary( args ):
    print( tabulate( displayList[ displayStart : displayEnd ],
                     headers=[ 'pkg', 'reason' ] ) )
 
+class PackageDif:
+   def __init__( self, rbi: AbuildInfo, ibi: AbuildInfo, pkg: str ):
+      self.rbi = rbi
+      self.ibi = ibi
+
+      self.rlog = None
+      self.ilog = None
+      self.rdeplog = None
+      self.ideplog = None
+
+def diffPackageCmd( args ):
+   rbi = getAbuildInfo( args.reference_id )
+   ibi = getAbuildInfo( args.inspect_id )
+
+   assert rbi.platform == ibi.platform
+   pkg = args.pkg
+
+   with SshClient( rbi.bs ) as refClient, SshClient( ibi.bs ) as insClient:
+      rhi = HashInfo( rbi )
+      ihi = HashInfo( ibi )
+
+      for client, hi in zip( [ refClient, insClient ], [ rhi, ihi ] ):
+         hi.bi.validate( client, pkg )
+         #hi.loadLogs()
+      import pdb
+      pdb.set_trace()
+      print( "hello" )
+
 def main():
    args = parseArgs()
    if args.subcommand == 'diff':
       if args.diff_subcommand == 'summary':
-         diffSummary( args )
+         diffSummaryCmd( args )
+      elif args.diff_subcommand == 'package':
+         diffPackageCmd( args )
+      else:
+         assert False, f'Unknown diff subcommand {args.diff_subcommand}'
+   else:
+      assert False, f'Unknown subcommand {args.subcommand}'
 
 if __name__ == "__main__":
    main()
